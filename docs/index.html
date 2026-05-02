@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Composite Multi-Component Reward Functions for Tool-Using LLM Orchestrators</title>
+  <meta name="description" content="A four-component composite reward function for tool-using LLM orchestrators, characterised on a 16-trace evaluation log over four production tools.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topnav">
+  <div class="topnav-inner">
+    <div class="brand">paper-composite-reward</div>
+    <nav>
+      <a href="#abstract">Abstract</a>
+      <a href="#contributions">Contributions</a>
+      <a href="#method">Method</a>
+      <a href="#results">Results</a>
+      <a href="#context">Context</a>
+      <a href="#cite">Cite</a>
+    </nav>
+    <div class="pills">
+      <a class="pill primary" href="paper.pdf">Paper (PDF)</a>
+      <a class="pill" href="https://github.com/Vizuara-AI-Lab/paper-composite-reward-tool-using-llm-orchestrators">Code</a>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <div class="hero">
+    <div class="eyebrow">RL · Tool-Using LLM Agents · Reward Design</div>
+    <h1>A four-component composite reward function for tool-using LLM orchestrators, characterised on a 16-trace evaluation log.</h1>
+    <p class="lede">
+      Mean composite reward 7.64/10 across 16 traces. Reward is monotone in tool-call count: 8.75/10 at the two-call budget, declining to 6.53/10 at five calls. Three named failure modes leave distinct fingerprints across correctness, efficiency, cost, and quality, giving a downstream RL learner the diagnostic signal it needs.
+    </p>
+
+    <dl class="metadata-grid">
+      <div><dt>Author</dt><dd>Rushit Parmar</dd></div>
+      <div><dt>Primary metric</dt><dd>Composite reward (0–10)</dd></div>
+      <div><dt>Result</dt><dd>7.64 / 10</dd></div>
+      <div><dt>Traces</dt><dd>16 (held-out)</dd></div>
+      <div><dt>Base policy</dt><dd>Qwen2.5-0.5B-Instruct</dd></div>
+      <div><dt>Eval source</dt><dd>conversation-sample.json</dd></div>
+      <div><dt>Tools</dt><dd>octra · falcon · prisma · firecrawl_search</dd></div>
+      <div><dt>Cost cap</dt><dd>$0.05 per trace</dd></div>
+      <div><dt>License</dt><dd>MIT</dd></div>
+    </dl>
+  </div>
+
+  <section id="abstract">
+    <h2><span class="section-num">01</span>Abstract</h2>
+    <div class="section-narrow">
+      <p>Enterprise LLM agents are increasingly asked to act, not just answer, and a single user query may chain through several tools whose dollar cost, latency, and answer quality must be traded off jointly. Most current orchestrators are prompt-engineered ReAct loops, leaving practitioners with no principled signal to train against. We define a four-component composite reward function for tool-using LLM orchestrators that combines an LLM-judged correctness signal against a reference tool sequence (weight 0.40), a closed-form efficiency penalty against a per-trace tool-call budget (0.20), a closed-form dollar-cost penalty against a spend cap (0.20), and an LLM-judged answer-quality signal (0.20), each on a 0 to 10 scale.</p>
+      <p>We characterise the reward function on a 16-trace held-out evaluation log of an enterprise sales-analytics workflow over four production tools (octra, falcon, prisma, firecrawl_search). The reward attains a mean composite score of <strong>7.64/10</strong> (range 6.50 to 8.86), is monotone in tool-call count (8.75/10 at the two-call budget, dropping to 6.53/10 at five calls), and isolates three recurring orchestrator failure modes (repeated SQL, failed chart generation, empty result sets) into distinct per-component fingerprints. All judge calls are content-addressed and cached in SQLite, making the reward signal reproducible bit-for-bit and turn-key as a <code>reward_funcs</code> argument for GRPO training of a Qwen2.5 orchestrator policy.</p>
+    </div>
+  </section>
+
+  <section id="contributions">
+    <h2><span class="section-num">02</span>Contributions</h2>
+    <div class="cards3">
+      <div class="card">
+        <div class="num">01</div>
+        <h3>Composite reward function</h3>
+        <p>Four bounded sub-rewards (correctness, efficiency, cost, quality) on a 0–10 scale combined under a fixed 0.40 / 0.20 / 0.20 / 0.20 convex weighting.</p>
+      </div>
+      <div class="card">
+        <div class="num">02</div>
+        <h3>16-trace characterisation</h3>
+        <p>Per-trace and per-component decompositions over a held-out enterprise sales-analytics log, releasing both the aggregate scores and the underlying judge rationales.</p>
+      </div>
+      <div class="card">
+        <div class="num">03</div>
+        <h3>Diagnostic fingerprints</h3>
+        <p>Three orchestrator failure modes (repeated falcon, failed prisma chart, empty result sets) leave distinct fingerprints across the four components — the property a downstream RL learner needs.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="method">
+    <h2><span class="section-num">03</span>How it works</h2>
+    <div class="section-narrow">
+      <p>The orchestrator policy emits a tool-call sequence over four production tools and a free-form natural-language answer. Each trajectory is scored along four reward components: correctness (an LLM judge compares the actual tool sequence against an expert-defined reference set), efficiency (a closed-form penalty against a per-trace tool-call budget of two), cost (a closed-form penalty against a $0.05 spend cap), and quality (a second LLM judge scores the final natural-language answer for formatting, completeness, and clarity).</p>
+      <p>The four components are combined under the convex weighting <code>R = 0.40 · correctness + 0.20 · efficiency + 0.20 · (1 − cost) + 0.20 · quality</code>, with each term bounded to <code>[0, 10]</code> so that <code>R</code> itself lives on the same 0–10 scale as any single component. Every LLM-judge verdict is keyed by the SHA-256 of the (query, output, component, expected-tools) tuple and cached in SQLite, so identical re-evaluations are free and long GRPO runs amortise judge cost over thousands of repeated query prefixes.</p>
+    </div>
+    <figure class="wide-figure">
+      <img src="figures/fig-architecture.png" alt="Block diagram of the orchestrator-reward pipeline showing user query, orchestrator policy, four tool boxes, reward judge with four components, composite reward, and GRPO update feedback arrow.">
+      <figcaption>Figure 1 — End-to-end pipeline. Trajectories are scored by four reward components, reduced to a single composite scalar, and consumed as a GRPO reward.</figcaption>
+    </figure>
+  </section>
+
+  <section id="results">
+    <h2><span class="section-num">04</span>What we found</h2>
+    <div class="big-metric">
+      <div class="metric-value">7.64 / 10</div>
+      <div class="metric-label">Mean composite reward across 16 held-out traces (range 6.50 to 8.86)</div>
+    </div>
+    <div class="section-narrow">
+      <p>The reward is monotone in tool-call count: traces respecting the two-call budget score 8.75/10 on average, declining to 7.46 at three calls, 6.78 at four, and 6.53 at five. The five-call traces specifically lose six efficiency points (efficiency score 4.0/10) because the closed-form efficiency penalty clamps at the budget. Realised cost stays in a tight band of $0.0076 to $0.0118 against the $0.05 budget, so the vertical spread in composite score is driven by tool-call structure, not dollar spend.</p>
+    </div>
+    <figure class="wide-figure">
+      <img src="figures/fig-score-by-calls.png" alt="Bar chart of average composite score by number of tool calls, with the 2-call bar at 8.75 highlighted and a budget threshold line.">
+      <figcaption>Figure 2 — Average composite reward partitioned by tool-call count. Reward peaks at the 2-call budget and decays monotonically beyond it.</figcaption>
+    </figure>
+    <figure class="wide-figure">
+      <img src="figures/fig-failure-modes.png" alt="Grouped bar chart of average per-component point drop for three failure modes (repeated falcon, failed prisma chart, empty result set) across correctness, efficiency, cost, quality.">
+      <figcaption>Figure 3 — Per-component point drop attributable to each of the three named failure modes. The fingerprints are visibly distinct across correctness, efficiency, cost, and quality.</figcaption>
+    </figure>
+  </section>
+
+  <section id="context">
+    <h2><span class="section-num">05</span>Context and limitations</h2>
+    <div class="section-narrow">
+      <p>These results characterise the reward function as a measurement instrument, not yet a trained policy. The 16-trace evaluation is small, comes from a single conversation-sample.json log, and was produced by an untrained 0.5B-parameter Qwen2.5 orchestrator. Cost is reported in simulator-USD against a fixed $0.05 cap, not measured wall-clock token spend. Two of the four components rely on a generative judge that inherits its own biases; the SQLite cache makes verdicts content-addressed and reproducible but inter-judge agreement is not yet quantified. Next steps include scaling to a 500-query suite, reporting inter-judge agreement between Mock, OpenAI, and Anthropic judges (almost free given the cache), and closing the loop with a Qwen2.5-7B GRPO training run.</p>
+    </div>
+  </section>
+
+  <section id="next-steps">
+    <h2><span class="section-num">06</span>Where to go next</h2>
+    <div class="cta-grid">
+      <a class="cta-card" href="paper.pdf">
+        <div class="num">01</div>
+        <h3>Read the paper →</h3>
+        <p>Full method, equations, and per-trace tables in the compiled PDF.</p>
+      </a>
+      <a class="cta-card" href="https://github.com/Vizuara-AI-Lab/paper-composite-reward-tool-using-llm-orchestrators">
+        <div class="num">02</div>
+        <h3>See the code →</h3>
+        <p>This repo: paper source, figures, audit log, and state snapshot.</p>
+      </a>
+      <a class="cta-card" href="https://github.com/rushitparmar-lab/eval">
+        <div class="num">03</div>
+        <h3>Reproduce →</h3>
+        <p>The orchestrator-reward Python package and the 16-trace evaluation log.</p>
+      </a>
+      <a class="cta-card" href="#cite">
+        <div class="num">04</div>
+        <h3>Cite →</h3>
+        <p>Copy-ready BibTeX block below.</p>
+      </a>
+    </div>
+  </section>
+
+  <section id="cite">
+    <h2><span class="section-num">07</span>Cite</h2>
+    <div class="cite-block">
+      <button type="button" class="cite-copy-btn" data-target="cite-bibtex" aria-label="Copy BibTeX to clipboard">Copy</button>
+<pre><code id="cite-bibtex">@misc{parmar2026compositereward,
+  title  = {Composite Multi-Component Reward Functions for Tool-Using LLM Orchestrators: A 16-Trace Characterisation},
+  author = {Parmar, Rushit},
+  year   = {2026},
+  url    = {https://github.com/Vizuara-AI-Lab/paper-composite-reward-tool-using-llm-orchestrators}
+}</code></pre>
+    </div>
+    <script>
+      document.querySelectorAll('.cite-copy-btn').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          var id = btn.getAttribute('data-target');
+          var node = document.getElementById(id);
+          if (!node) return;
+          var text = node.innerText;
+          var done = function(){
+            var orig = btn.textContent;
+            btn.classList.add('is-copied');
+            btn.textContent = 'Copied';
+            setTimeout(function(){
+              btn.classList.remove('is-copied');
+              btn.textContent = orig === 'Copied' ? 'Copy' : orig;
+            }, 1500);
+          };
+          if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(done, function(){
+              var range = document.createRange();
+              range.selectNodeContents(node);
+              var sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+              try { document.execCommand('copy'); } catch(e) {}
+              sel.removeAllRanges();
+              done();
+            });
+          } else {
+            var range = document.createRange();
+            range.selectNodeContents(node);
+            var sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            try { document.execCommand('copy'); } catch(e) {}
+            sel.removeAllRanges();
+            done();
+          }
+        });
+      });
+    </script>
+  </section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <div>
+      <div class="brand-mark">paper-composite-reward</div>
+      <p>A four-component composite reward function for tool-using LLM orchestrators. Released under the MIT license; copyright Rushit Parmar.</p>
+    </div>
+    <div>
+      <h4>Navigate</h4>
+      <ul>
+        <li><a href="#abstract">Abstract</a></li>
+        <li><a href="#method">Method</a></li>
+        <li><a href="#results">Results</a></li>
+        <li><a href="#cite">Cite</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>External</h4>
+      <ul>
+        <li><a href="paper.pdf">Paper (PDF)</a></li>
+        <li><a href="https://github.com/Vizuara-AI-Lab/paper-composite-reward-tool-using-llm-orchestrators">GitHub</a></li>
+        <li><a href="https://github.com/rushitparmar-lab/eval">Eval package</a></li>
+        <li><a href="https://github.com/rushitparmar-lab/rl-tool-router">Orchestrator</a></li>
+      </ul>
+    </div>
+    <div class="copyright">
+      <p>Session 20260502-023040-6b22.</p>
+      <p>© 2026 Rushit Parmar.</p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
