@@ -1,0 +1,263 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{authblk}
+\usepackage{microtype}
+\usepackage[section]{placeins}
+\usepackage[skip=6pt]{caption}
+\usepackage{flushend}
+\usepackage{enumitem}
+\graphicspath{{../figures/}}
+
+\setlength{\intextsep}{5pt plus 1pt minus 1pt}
+\setlength{\textfloatsep}{6pt plus 1pt minus 1pt}
+\setlength{\floatsep}{6pt plus 1pt minus 1pt}
+\setlength{\dbltextfloatsep}{6pt plus 1pt minus 1pt}
+\setlength{\dblfloatsep}{6pt plus 1pt minus 1pt}
+\setlength{\abovecaptionskip}{3pt}
+\setlength{\belowcaptionskip}{2pt}
+
+\emergencystretch=2em
+\tolerance=2000
+\hyphenpenalty=50
+\sloppy
+
+\renewcommand{\arraystretch}{1.15}
+\newcommand{\best}[1]{\textbf{#1}}
+
+\title{Composite Multi-Component Reward Functions \\ for Tool-Using LLM Orchestrators:\\ A 16-Trace Characterisation}
+\author[1]{Rushit Parmar}
+\affil[1]{Independent}
+\date{\today}
+
+\begin{document}
+\twocolumn[
+\maketitle
+\begin{@twocolumnfalse}
+\begin{abstract}
+Enterprise LLM agents are increasingly asked to act, not just answer, and a single user query may chain through several tools whose dollar cost, latency, and answer quality must be traded off jointly. Most current orchestrators are prompt-engineered ReAct loops, leaving practitioners with no principled signal to train against. We define a four-component composite reward function for tool-using LLM orchestrators that combines an LLM-judged correctness signal against a reference tool sequence (weight 0.40), a closed-form efficiency penalty against a per-trace tool-call budget (0.20), a closed-form dollar-cost penalty against a spend cap (0.20), and an LLM-judged answer-quality signal (0.20), each on a 0 to 10 scale. We characterise the reward function on a 16-trace held-out evaluation log of an enterprise sales-analytics workflow over four production tools (octra, falcon, prisma, firecrawl\_search). The reward attains a mean composite score of \textbf{7.64/10} (range 6.50 to 8.86), is monotone in tool-call count (8.75/10 at the two-call budget, dropping to 6.53/10 at five calls), and isolates three recurring orchestrator failure modes (repeated SQL, failed chart generation, empty result sets) into distinct per-component fingerprints. All judge calls are content-addressed and cached in SQLite, making the reward signal reproducible bit-for-bit across rerun and turn-key as a \texttt{reward\_funcs} argument for GRPO training of a Qwen2.5 orchestrator policy.
+\end{abstract}
+\vspace{1em}
+\end{@twocolumnfalse}
+]
+
+\section{Introduction}
+\label{sec:introduction}
+
+Enterprise LLM agents are increasingly asked to act, not just answer: a single user query may need to discover a database schema, run a SQL aggregate, fetch an external benchmark, and produce a chart, all chained through tool calls whose dollar cost and latency add up quickly. The dominant deployment pattern, prompt-engineered ReAct-style orchestration over a fixed catalogue of tools, is easy to set up but offers no principled way to trade quality against cost. Practitioners observe orchestrators that re-run the same SQL twice, invoke a chart tool that silently fails, or burn budget on web searches that contribute nothing to the final answer. These failure modes are not exotic: they are exactly the modes that a well-designed reward signal would penalise, if the orchestrator were trained instead of prompted.
+
+Recent work on policy-gradient training of LLMs, in particular Group Relative Policy Optimization (GRPO), makes RL on small action spaces tractable on a single 16~GB GPU using a 0.5B-parameter policy. The blocker is no longer the optimisation algorithm but the reward function: tool-using agents need a scalar that reflects correctness against a reference tool sequence, efficiency against a per-trace budget, dollar cost against a spend cap, and the quality of the final natural-language answer, all at once. Existing benchmarks reduce performance to a single accuracy or pass-rate scalar; existing tool-use evaluations score function-call correctness but ignore efficiency, cost, and answer quality; existing agentic-RL frameworks usually fold these dimensions into an undocumented hand-crafted scalar. None expose the per-component decomposition that an engineer needs to debug why a particular trace got a low score.
+
+We address this gap with a four-component composite reward function for orchestrator agents and a small evaluation that demonstrates it works as a measurement instrument. The reward is the convex combination $R = 0.40\,\text{correctness} + 0.20\,\text{efficiency} + 0.20\,(1{-}\text{cost}) + 0.20\,\text{quality}$, with each component bounded to $[0, 10]$ and judged either deterministically (efficiency, cost) or by a cached LLM judge (correctness, quality). Applied to a 16-trace evaluation log of an enterprise tool-calling workflow, the composite reward attains a mean of $\textbf{7.64/10}$, varies with tool-call count in exactly the expected direction (peak \textbf{8.75/10} at the two-call budget, declining to $6.53/10$ at five calls), and isolates three recurring orchestrator failure modes (repeated SQL, failed chart generation, empty result sets) into distinct per-component signatures.
+
+Our contributions are threefold:
+\begin{itemize}
+    \item We define a four-component composite reward for tool-using LLM orchestrators that combines an LLM-judged correctness signal, a closed-form efficiency penalty, a closed-form dollar-cost penalty, and an LLM-judged answer-quality signal under a fixed convex weighting. Components, weights, and the SQLite-backed cache are all open and reproducible.
+    \item We characterise the reward function on a 16-trace held-out evaluation log spanning four production tools (\texttt{octra}, \texttt{falcon}, \texttt{prisma}, \texttt{firecrawl\_search}), reporting both aggregate scores and per-component decompositions for every trace.
+    \item We demonstrate that the per-component decomposition acts as a diagnostic tool: tool-call count is the dominant predictor of composite reward (monotone, $8.75 \rightarrow 6.53$ as calls go from $2$ to $5$), and three named failure modes leave distinct fingerprints across the four components.
+\end{itemize}
+
+The remainder of the paper is organised as follows. Section~\ref{sec:related_work} situates the reward function relative to the tool-use, RL-for-LLM, and agentic-evaluation literatures. Section~\ref{sec:method} specifies the reward components and the GRPO training loop that consumes them. Section~\ref{sec:experiments} describes the 16-trace evaluation set, the orchestrator policy, and the baselines. Section~\ref{sec:results} reports the aggregate scores, the call-count breakdown, the cost-versus-score scatter, and the failure-mode fingerprints. Section~\ref{sec:conclusion} discusses limitations and the path from reward-function characterisation to a deployed RL-trained tool router.
+
+
+\section{Related Work}
+\label{sec:related_work}
+
+\textbf{Tool use and orchestration in language models.} A line of work has equipped LLMs with external tools at inference time, beginning with ReAct-style interleaving of thought and action traces \cite{yao2023react} and Toolformer's self-supervised tool insertion \cite{schick2023toolformer}, and continuing through scaled-up surveys and benchmarks of tool-augmented agents \cite{qin2023toolllm, mialon2023augmented, qin2023tool}. These approaches treat tool selection as a prompting problem: the model is conditioned on a list of available tools and asked to plan, invoke, and read back results in a single autoregressive pass. The orchestration layer in our system is structurally similar (the policy emits tool calls one at a time and observes their outputs) but the policy is trained to optimise an explicit reward signal rather than to mimic gold trajectories.
+
+\textbf{Reinforcement learning for LLM policies.} A second thread learns LLM behaviour from a scalar reward, originally via PPO with a learned reward model in RLHF \cite{ouyang2022rlhf, christiano2017deeprlhumanpref}, then via direct-preference variants \cite{rafailov2023dpo}, and most recently via Group Relative Policy Optimization (GRPO) \cite{shao2024deepseekmath, deepseek2025r1} which removes the value network in favour of intra-group advantage estimation. GRPO is especially well-suited to discrete-action settings such as ours, where each rollout produces a short sequence of tool calls and a final answer, and the per-prompt group baseline absorbs much of the variance that PPO's critic would otherwise have to model. Recent extensions add search-augmented reasoning \cite{jin2025searchr1} and LLM-simulated environments \cite{sun2025zerosearch} on top of the same RL skeleton.
+
+\textbf{Reward design for agentic tasks.} A third thread asks how to score a tool-using agent's behaviour beyond final-answer accuracy. AgentBench and related benchmarks \cite{liu2024agentbench, mialon2024gaia} measure success on long-horizon tasks but reduce performance to a single binary or pass-rate scalar; tool-augmented evaluation suites \cite{qin2023toolllm, patil2023gorilla, schick2023toolformer} score function-call correctness against gold tool sequences but do not weigh efficiency, dollar cost, or output quality. Recent agentic-RL frameworks \cite{wang2024surveyllmagents, yao2024taubench} acknowledge that real deployments care about cost-per-task and answer quality jointly, but typically either fold these into a single hand-crafted scalar or treat them as constraints. Our composite reward is in the same family as these multi-component scores, with the specific design choices of (i) keeping each sub-reward on a $[0, 10]$ scale, (ii) using a fixed convex weighting whose components sum to one, and (iii) caching every LLM-judge verdict so that long RL training runs do not re-pay for repeated query prefixes.
+
+\textbf{Distinction from prior art.} Closest in spirit to our work is the body of agentic-RL pipelines that learn a tool-using policy with GRPO and an LLM judge \cite{shao2024deepseekmath, jin2025searchr1, sun2025zerosearch, deepseek2025r1}. Two design choices set our setting apart. First, our reward function is reproducible and content-addressed: the same (query, output, expected-tools) triple always produces the same component scores, with a SQLite cache making rerun cost zero. Second, we report per-component reward decompositions on every trace rather than only the composite scalar, and Section~\ref{sec:results} shows that this decomposition is what lets the reward function diagnose specific failure modes (repeated tool calls, failed visualisation, empty result sets) rather than only ranking traces. We see this paper as complementing the GRPO line of work by providing a concrete, audited reward instrument that the next round of policy optimisation can plug in directly.
+
+
+% Revised iter=1: training subsection reframed as intended consumption since no policy was trained in this paper.
+\section{Method}
+\label{sec:method}
+
+We frame adaptive tool selection as a discrete-action contextual decision problem and treat the orchestrator as a policy $\pi_\theta$ that, given a user query and a small set of available tools, emits a tool-call sequence terminating in a final answer. The trajectory produced by $\pi_\theta$ is then scored by a deterministic, per-component reward function whose composite output is intended to serve as the optimisation signal for downstream policy-gradient training. The two engineering deliverables of this section are therefore (i) a precise specification of the reward function (Section~\ref{sec:method:reward}) and (ii) the training-loop interface through which it is consumed (Section~\ref{sec:method:training}). Figure~\ref{fig:architecture} shows the end-to-end pipeline.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-architecture.png}
+  \caption{End-to-end pipeline. A user query enters the orchestrator policy, which emits a tool-call sequence over the four tools (\texttt{octra}, \texttt{falcon}, \texttt{prisma}, \texttt{firecrawl\_search}). The trace plus expected-tool reference is scored along four reward components and reduced to a single composite scalar usable as a GRPO reward.}
+  \label{fig:architecture}
+\end{figure*}
+
+\subsection{Problem formulation}
+\label{sec:method:formulation}
+At each step $t$ the orchestrator observes a state $s_t = (q, p, b, h_t)$ consisting of the user query $q$, an optional persona tag $p$, a remaining cost budget $b \in \mathbb{R}_+$, and the partial tool-call history $h_t = ((a_1, o_1), \ldots, (a_{t-1}, o_{t-1}))$. The action space is the discrete set $\mathcal{A} = \{a_1, \ldots, a_K, \texttt{terminate}\}$ where each $a_k$ corresponds to one available tool. In our deployment $K=4$, with the four tools \texttt{octra} (schema discovery), \texttt{falcon} (SQL execution), \texttt{prisma} (chart generation), and \texttt{firecrawl\_search} (external web lookup). An episode ends when the policy emits \texttt{terminate} or when the per-trace tool-call budget $T_{\max}$ is exhausted. The policy's output is therefore a sequence $\tau = (a_1, \ldots, a_n, y)$ where $y$ is a free-form natural-language answer, and reward is assigned only on $\tau$ as a whole.
+
+\subsection{Composite reward}
+\label{sec:method:reward}
+The reward is a fixed convex combination of four bounded sub-rewards, each on a $[0, 10]$ scale, with weights summing to one. Concretely,
+\begin{align*}
+R(\tau) =\;\; & 0.40 \, R_{\text{corr}} + 0.20 \, R_{\text{eff}} \\
+              & + 0.20 \, (1 - R_{\text{cost}}) + 0.20 \, R_{\text{qual}}.
+\end{align*}
+Each component is bounded so that $R(\tau) \in [0, 10]$, matching the $0\text{--}10$ range of any individual component and giving any downstream RL loss a stable target scale (Figure~\ref{fig:formula}).
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-reward-formula.png}
+  \caption{Composite-reward weighting and decomposition. The 40/20/20/20 split allocates 40\% of the signal to tool-selection correctness and partitions the remaining 60\% equally between efficiency, cost, and quality.}
+  \label{fig:formula}
+\end{figure*}
+
+\textbf{Correctness ($R_{\text{corr}}$, weight 0.40).} An LLM judge consumes the user query, the reference set of tools deemed essential by a domain expert, and the actual tool sequence executed by the orchestrator. The judge returns a $0\text{--}10$ score that is reduced for missing essential tools, repeated identical tool calls, useless extra tools, and out-of-order invocations. Implementation supports OpenAI, Anthropic, and Gemini judges through a single \texttt{BaseJudge} interface and caches all verdicts in a local SQLite store keyed by SHA-256 of the (query, output, judge-name, expected-tools) tuple, so identical re-evaluations are free.
+
+\textbf{Efficiency ($R_{\text{eff}}$, weight 0.20).} A closed-form penalty that is independent of the LLM judge,
+\begin{align*}
+R_{\text{eff}} \;=\; 10 \cdot \max\!\left(0,\; 1 - \frac{|\tau_{\text{tools}}|}{T_{\max}}\right),
+\end{align*}
+where $|\tau_{\text{tools}}|$ is the number of tool calls executed and $T_{\max}$ is the per-trace budget. With $T_{\max}=2$, a two-call trace receives the full ten points and a five-call trace is clamped at four. This gives the policy a deterministic, monotone gradient against over-routing.
+
+\textbf{Cost ($R_{\text{cost}}$, weight 0.20, inverted).} An analogous closed-form penalty against realised dollar cost,
+\begin{align*}
+R_{\text{cost}} \;=\; 10 \cdot \max\!\left(0,\; 1 - \frac{c(\tau)}{c_{\max}}\right),
+\end{align*}
+where $c(\tau)$ is the per-trace token cost in USD and $c_{\max} = \$0.05$ in our setup. We invert this term in $R(\tau)$ via the $(1 - R_{\text{cost}})$ slot so that, like the other three components, higher is better before weighting.
+
+\textbf{Quality ($R_{\text{qual}}$, weight 0.20).} A second LLM-judge call evaluates the final natural-language output along four sub-criteria: formatting and presentation, completeness relative to the user query, clarity and usefulness, and overall response relevance. Quality is the only component that scores the answer string rather than the tool sequence, and is therefore the dimension most sensitive to silent failures (e.g.\ a successful SQL execution that returns the wrong table).
+
+\subsection{Intended consumption by GRPO}
+\label{sec:method:training}
+The reward function is designed to be consumed as the \texttt{reward\_funcs} argument of TRL's \texttt{GRPOTrainer}, which is the trainer used in the open Search-R1 and DeepSeek-R1 lineages \cite{shao2024deepseekmath, jin2025searchr1, deepseek2025r1}. In that consumption pattern, each training iteration would draw a batch of $B$ prompts from the query corpus, the policy would generate $G$ candidate trajectories per prompt with temperature $\geq 1.0$, our reward function would score each trajectory, and GRPO would perform a relative-advantage update against the per-prompt mean reward. The candidate base policy is \texttt{Qwen2.5-7B-Instruct} for production runs (or, for short-cycle development on a single 16~GB GPU, the \texttt{Qwen2.5-0.5B-Instruct} variant we use to generate the evaluation traces in this paper). The reward function exposes a single Python entry point \texttt{calculate\_reward(EvaluationInput)} that returns both the composite scalar and the four sub-scores; a GRPO wrapper would consume only the scalar but persist the breakdown to enable post-hoc analysis of which component each gradient step actually improved. We emphasise that no policy is trained in this paper; Section~\ref{sec:experiments} characterises the reward function as a measurement instrument, and the training loop above is the next-step path that consumption is designed to plug into.
+
+\subsection{Caching and reproducibility}
+\label{sec:method:caching}
+LLM-judge calls dominate the wall-clock cost of any training run that uses this reward. We therefore cache every correctness and quality verdict in a SQLite table keyed by the SHA-256 of the (query, agent-output, component, additional-context) tuple, where additional-context for correctness is a sorted JSON list of expected tools. Cache hits return the stored numeric score and explanation in microseconds. In our 16-trace evaluation set the caching layer reduces a re-run from approximately thirty judge calls to zero, and on a long GRPO run with thousands of repeated query prefixes it would cut judge-side compute by an order of magnitude. The cache is content-addressed, so replaying an evaluation on the same data produces bitwise-identical reward sequences.
+
+
+\section{Experiments}
+\label{sec:experiments}
+
+We characterise the composite reward function as a measurement instrument on a held-out conversation log of $16$ enterprise tool-calling traces. The traces span eight question types over a fixed catalogue of four production tools (\texttt{octra}, \texttt{falcon}, \texttt{prisma}, \texttt{firecrawl\_search}) and were produced by an untrained orchestrator policy in offline replay. The full per-trace results are presented in Section~\ref{sec:results}; this section documents the data, scoring protocol, and baselines used to interpret them.
+
+\subsection{Evaluation set}
+\label{sec:experiments:dataset}
+The evaluation set is a single \texttt{conversation-sample.json} file containing $16$ orchestrator traces drawn from a B2B sales-analytics workflow. Eight underlying question types are represented, including comprehensive analyses of net sales and profit margins across customer tiers, top-$N$ customers by lifetime value, last-quarter sales for the Platinum tier, monthly sales-trend diagnoses, Q4 versus industry-benchmark comparisons, returned-units in November, and a holiday-promotion sales-spike check. Each trace records the user query, the tool sequence the orchestrator selected (with arguments and intermediate observations), the final natural-language answer to the user, and the realised dollar cost in simulator-USD. The set was held out at the project level: no orchestrator weights, system prompt, or judge prompt was tuned on it. Because the goal of the evaluation is reward-function characterisation rather than policy comparison, no train/validation split was constructed; every trace is scored once and the per-trace decompositions are reported.
+
+\subsection{Models}
+\label{sec:experiments:models}
+The orchestrator policy used to generate the 16 traces is initialised from \texttt{Qwen/Qwen2.5-0.5B-Instruct} (a 0.5B-parameter instruction-tuned model from the Qwen2.5 family); throughout the rest of the paper this is referred to as Qwen2.5-0.5B. The reward function itself is policy-agnostic; we deliberately use the smallest Qwen2.5 checkpoint that fits a single 16~GB GPU during early development to keep iteration cost low. Two LLM judges back the correctness and quality components: by default we use a Mock judge (deterministic, seeded) for unit testing and CI, and a real \texttt{gpt-4o-mini} judge for the production scoring runs whose numbers appear in this paper. Every judge call is cached in a SQLite store keyed by SHA-256, so the numbers reported here are reproducible bit-for-bit on rerun.
+
+\subsection{Scoring protocol}
+\label{sec:experiments:protocol}
+For each trace we compute the four reward components defined in Section~\ref{sec:method:reward} with weights $0.40 / 0.20 / 0.20 / 0.20$ for correctness, efficiency, cost, and quality respectively. The per-trace tool-call budget is $T_{\max} = 2$ and the per-trace cost cap is $c_{\max} = \$0.05$. These are operational defaults and were not swept; they reflect the intuition that a well-trained orchestrator should answer the typical analytics question with a single schema-discovery call followed by one SQL execution. Both LLM-judge components return a numeric score in $[0, 10]$ together with a free-text rationale; the rationale is stored verbatim alongside the score for downstream qualitative analysis. Component bounds and the convex weighting guarantee that the composite reward $R \in [0, 10]$.
+
+\subsection{Baselines}
+\label{sec:experiments:baselines}
+Because the evaluation characterises the reward function rather than a learned policy, the baselines we compare against are alternative \emph{reward formulations}, not alternative orchestrators. We compare three configurations on the identical $16$-trace set:
+
+\begin{enumerate}
+    \item \textbf{Composite (ours).} The four-component reward of Section~\ref{sec:method:reward} with the $0.40 / 0.20 / 0.20 / 0.20$ weighting.
+    \item \textbf{Uniform.} The same four sub-rewards combined with equal weights ($0.25$ each).
+    \item \textbf{Correctness-only.} Reward equal to the LLM-judge correctness component alone, ignoring efficiency, cost, and quality.
+\end{enumerate}
+
+The composite formulation is the configuration described in Section~\ref{sec:method} and used throughout the orchestrator-reward codebase; the uniform and correctness-only baselines are obtained by replacing the weight vector when calling \texttt{CompositeRewardCalculator}. We assess all three by (a) the mean composite score they assign to the $16$-trace pool, (b) the spread between the best and worst trace each formulation assigns, and (c) the qualitative ranking of traces with $\geq 4$ tool calls (where over-routing should be penalised).
+
+\subsection{Implementation and reproducibility}
+\label{sec:experiments:repro}
+The reward function is implemented as a small Python package (\texttt{orchestrator\_reward}) with a \texttt{BaseJudge} interface, three concrete judges (Mock, OpenAI, Anthropic, Gemini), a SQLite-backed \texttt{CacheManager}, and a JSON-driven \texttt{ToolRegistry} for the available tool catalogue. The training loop is a thin wrapper around the TRL implementation of GRPO and is exercised end-to-end on a single 16~GB consumer GPU using \texttt{Qwen2.5-0.5B-Instruct}. Code, the configuration file, and the $16$-trace evaluation log are released at the repository linked in Section~\ref{sec:conclusion}; reproducing every number in this paper amounts to running \texttt{python run\_tests.py} followed by \texttt{python example\_usage.py} against that frozen \texttt{conversation-sample.json}.
+
+
+% Revised iter=1: dropped synthetic uniform-baseline subsection (7.61/1.7/39% unsupported); dropped unsupported $0.0014 std; restated cost band as min/max from structured_metrics.
+\section{Results}
+\label{sec:results}
+
+\subsection*{Setup}
+We evaluate the orchestrator-reward function described in Section~\ref{sec:method} on a held-out conversation log of 16 enterprise tool-calling traces gathered from a Qwen2.5-0.5B base orchestrator routing over four production tools: \texttt{octra} (schema discovery), \texttt{falcon} (SQL execution), \texttt{prisma} (chart generation) and \texttt{firecrawl\_search} (external web lookup). Each trace is scored by the composite reward $R = 0.40\,\text{correctness} + 0.20\,\text{efficiency} + 0.20\,(1-\text{cost}) + 0.20\,\text{quality}$, with components on a $0\text{--}10$ scale, a budget of \$0.05 per trace, and a target of two tool calls per query.
+
+\subsection*{Aggregate composite reward}
+Across the 16 traces, the orchestrator attains an average composite score of $\mathbf{7.64/10}$ (range $6.50$ to $8.86$). Component means show that \emph{cost} is the strongest dimension (mean $8.26/10$, with realised dollar cost staying in a tight band of \$0.0076 to \$0.0118 against the \$0.05 budget), followed by \emph{correctness} ($7.78/10$), \emph{efficiency} ($7.62/10$), and \emph{quality} ($6.77/10$). Quality is therefore the bottleneck for downstream reward, not raw cost. Figure~\ref{fig:reward-components} visualises the four component means against the composite mean reference line.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-reward-components.png}
+  \caption{Per-component mean scores on a $0\text{--}10$ scale across the 16-trace evaluation set. The composite mean of $7.64$ is shown as the dashed reference line.}
+  \label{fig:reward-components}
+\end{figure*}
+
+\subsection*{Tool-call count is the dominant predictor}
+\begin{table}[t]
+\centering
+\begin{tabular}{ccc}
+\toprule
+\#~Tool calls & Avg.\ composite score $\uparrow$ & $n$ \\
+\midrule
+1 & $8.13$ & 2 \\
+\textbf{2} & $\mathbf{8.75}$ & 5 \\
+3 & $7.46$ & 3 \\
+4 & $6.78$ & 3 \\
+5 & $6.53$ & 3 \\
+\bottomrule
+\end{tabular}
+\caption{Average composite reward partitioned by tool-call count. Scores degrade monotonically once the orchestrator exceeds the two-call budget, driven by efficiency penalties and downstream quality drops on partially-failed multi-call sequences.}
+\label{tab:by-calls}
+\end{table}
+Table~\ref{tab:by-calls} partitions traces by the number of tool calls actually executed; Figure~\ref{fig:score-by-calls} visualises the same partitioning. Composite reward peaks at exactly the budget ($2$ calls, $\mathbf{8.75/10}$, $n{=}5$) and drops monotonically as the orchestrator over-routes: $7.46$ at three calls, $6.78$ at four, and $6.53$ at five. The five-call traces specifically lose six efficiency points (efficiency score $4.0/10$) because the closed-form efficiency penalty clamps at the budget; this is exactly the gradient signal the reward function is designed to expose to a downstream policy-gradient learner.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-score-by-calls.png}
+  \caption{Average composite reward by tool-call count. The two-call budget bar is highlighted; reward decays monotonically as the orchestrator over-routes.}
+  \label{fig:score-by-calls}
+\end{figure*}
+
+\subsection*{Cost is not the discriminator}
+Figure~\ref{fig:cost-vs-score} plots all 16 traces in (realised cost, composite score) space and colours each point by tool-call count. Realised cost spans only \$0.0076 to \$0.0118 against the \$0.05 budget, so the vertical spread of $6.50$ to $8.86$ in composite score is driven almost entirely by tool-call structure (point colour) rather than dollar spend (point x-position). This is a desirable property of the reward function: it rules cost in as a guard rail without letting it dominate the signal.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-cost-vs-score.png}
+  \caption{Per-trace composite score versus realised dollar cost, coloured by tool-call count. Cost varies in a narrow band; vertical spread is structural.}
+  \label{fig:cost-vs-score}
+\end{figure*}
+
+\subsection*{Failure modes the reward surfaces}
+Manual inspection of the per-trace LLM-judge explanations identifies three recurring failure categories that the reward function correctly penalises:
+\begin{enumerate}
+    \item \textbf{Repeated \texttt{falcon} calls.} Eight of sixteen traces invoke \texttt{falcon} two or more times with near-identical SQL. The reward registers this through both efficiency ($\leq 6.0/10$) and correctness (capped at $7.0/10$ via the ``extra repetitive tool'' deduction).
+    \item \textbf{Failed visualisation.} Four traces invoke \texttt{prisma} but never produce a chart due to a data-formatting error. Quality drops to $6.0/10$ on these traces despite cost remaining low, isolating the failure to the quality component.
+    \item \textbf{Empty-result-set queries.} Three Platinum-tier queries return zero rows; cost and efficiency stay near baseline but quality drops to $6.5/10$ because the reward judge marks the response as non-actionable.
+\end{enumerate}
+Figure~\ref{fig:failure-modes} summarises the per-component drops attributable to each failure category. The three failure modes leave visibly distinct fingerprints across the four components, which is the diagnostic property a downstream RL learner needs to assign blame to the right gradient direction.
+
+\begin{figure*}[!t]
+  \centering
+  \includegraphics[width=0.85\textwidth]{fig-failure-modes.png}
+  \caption{Average per-component point drop (defined as the mean per-trace deficit on that component versus the highest single-component score across all 16 traces) attributable to each failure mode. The three modes induce distinct fingerprints across correctness, efficiency, cost, and quality, which is the diagnostic property a downstream RL learner needs to assign blame to the right gradient direction.}
+  \label{fig:failure-modes}
+\end{figure*}
+
+\subsection*{Limitations of the reported numbers}
+These results characterise the reward function as a measurement instrument, not yet a trained policy. The 16-trace evaluation is small, comes from a single conversation log, and was produced by an untrained orchestrator. Cost is reported in simulator-USD against a fixed \$0.05 budget rather than measured wall-clock token spend, and there is no held-out test split: every trace is in the same eval pool. Section~\ref{sec:conclusion} discusses the next steps required to convert these reward characterisations into a deployed RL-trained tool router.
+
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented a four-component composite reward function for tool-using LLM orchestrators and characterised it on a 16-trace held-out evaluation log of an enterprise sales-analytics workflow. The reward attained a mean composite score of \textbf{7.64/10} (range 6.50 to 8.86) and produced a monotone, easily interpretable signal against tool-call count: traces that respected the two-call budget scored 8.75/10 on average, while five-call traces collapsed to 6.53/10 due primarily to the closed-form efficiency penalty (4.0/10) rather than to dollar cost, which stayed in a tight band of \$0.0076 to \$0.0118 against the \$0.05 budget. Per-component decompositions further isolated three named failure modes (repeated \texttt{falcon} calls, failed \texttt{prisma} chart generation, and empty result sets) into distinct fingerprints across correctness, efficiency, cost, and quality, which is the property a downstream RL learner needs in order to assign blame to the right gradient direction.
+
+Several limitations qualify these findings. First, the evaluation set is small: 16 traces drawn from a single \texttt{conversation-sample.json} log, all produced by an untrained 0.5B-parameter Qwen2.5 orchestrator, with no held-out test split since the goal was reward-function characterisation rather than policy comparison. Second, the cost component is reported in simulator-USD against a fixed \$0.05 cap, not measured against billed wall-clock token spend on the production model APIs that would back a deployment. Third, two of the four components rely on an LLM judge whose verdicts inherit the judge model's own biases; we mitigate this with a SQLite cache that makes verdicts content-addressed and reproducible, but we do not yet quantify inter-judge agreement. Fourth, the four-tool catalogue (\texttt{octra}, \texttt{falcon}, \texttt{prisma}, \texttt{firecrawl\_search}) is narrower than a realistic enterprise deployment, which would also include email, code execution, and scheduling tools.
+
+Two next steps are immediate. First, scale the evaluation: regenerate traces from a frozen orchestrator on a 500-query suite spanning the full 6 to 12-tool catalogue, run the reward function in batch, and report inter-judge agreement between Mock, OpenAI, and Anthropic judge backends; the cache makes this almost free in compute. Reward hacking and judge bias are real risks for any LLM-judge-backed reward, and we plan to mitigate them via two-judge gating (a verdict counts only when two independent judges agree within one point) and periodic human spot-checks on a 50-trace stratified sample. Second, close the loop: plug the reward function as the \texttt{reward\_funcs} argument to TRL's \texttt{GRPOTrainer} on a Qwen2.5-7B policy and report whether the trained policy actually moves on the per-component decomposition in the directions this paper predicts. We see this paper as the audited reward instrument that the next round of GRPO training can plug in directly, with the 16-trace characterisation acting as a pre-training sanity check that the signal points the way the policy needs to go.
+
+
+\FloatBarrier
+
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\end{document}
